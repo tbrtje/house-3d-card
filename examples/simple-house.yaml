@@ -28,6 +28,12 @@ house:
   doors:
     - { at: [12, 5.36], width: 2.6, height: 2.2 }
     - { at: [8, 5.36], width: 1.1, height: 2.15 }
+  # fixed windows replace the automatic ones on their wall and floor
+  windows:
+    - { at: [2, 5.36], width: 1.4, height: 1.3, sill: 0.8 }
+    - { at: [4.6, 5.36], width: 0.6, height: 1.0, sill: 1.0, shape: pointed }
+  roof_windows:
+    - { at: [3, 1.2], width: 0.78, height: 1.2 }
   # optional trees and shrubs (realistic style); tools/plants_from_ortho.py finds them on an aerial photo
   plants:
     - { at: [-4, -9], r: 3.2, h: 10 }

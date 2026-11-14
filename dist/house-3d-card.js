@@ -5,7 +5,7 @@
  * The house geometry lives in the card config, never in this file.
  * SPDX-License-Identifier: MIT
  */
-const VERSION = "1.2.1";
+const VERSION = "1.3.0";
 const THREE_URL = new URL("./three.module.min.js", import.meta.url).href;
 const WARM = [255, 183, 92];
 
@@ -860,6 +860,7 @@ class HouseReal extends HouseBase {
       hedge: new T.MeshStandardMaterial({ map: tex.hedge, roughness: 1 }),
       shedRoof: new T.MeshStandardMaterial({ color: 0x6d7076, roughness: 0.7, side: T.DoubleSide }),
       water: new T.MeshPhongMaterial({ color: 0x1b3440, specular: 0x9fb8c8, shininess: 90, transparent: true, opacity: 0.88 }),
+      post: new T.MeshStandardMaterial({ color: 0xa3a8ad, roughness: 0.7, side: T.DoubleSide }),
       canopy: new T.MeshStandardMaterial({ color: 0x9a8f80, roughness: 0.6, transparent: true, opacity: 0.85, side: T.DoubleSide }),
     };
     const add = (geo, m, opts = {}) => {
@@ -993,6 +994,37 @@ class HouseReal extends HouseBase {
     const a = u0 - o, b = u1 + o, va = v0 - o, vb = v1 + o;
     quad([P(a, yAt(a), va), P(um, r.ridge, va), P(um, r.ridge, vb), P(a, yAt(a), vb)]);
     quad([P(um, r.ridge, va), P(b, yAt(b), va), P(b, yAt(b), vb), P(um, r.ridge, vb)]);
+    if (r.open) {
+      // open gable (carport, terrace roof): verge boards instead of brick, roof on posts
+      [va, vb].forEach((v) => [a, b].forEach((u) => {
+        const g = new T.BufferGeometry();
+        g.setAttribute("position", new T.Float32BufferAttribute([...P(u, yAt(u), v), ...P(um, r.ridge, v),
+          ...P(um, r.ridge - 0.22, v), ...P(u, yAt(u) - 0.22, v)], 3));
+        g.setIndex([0, 1, 2, 0, 2, 3]);
+        g.computeVertexNormals();
+        this._add(g, this._mat.post);
+      }));
+      [v0, v1].forEach((v) => {
+        const beam = (p0, p1) => {
+          const g = new T.BufferGeometry();
+          const d = 0.08;
+          g.setAttribute("position", new T.Float32BufferAttribute([...p0, ...p1,
+            ...[p1[0], p1[1] - d, p1[2]], ...[p0[0], p0[1] - d, p0[2]]], 3));
+          g.setIndex([0, 1, 2, 0, 2, 3]);
+          g.computeVertexNormals();
+          this._add(g, this._mat.post);
+        };
+        beam(P(u0, r.eave, v), P(u1, r.eave, v));                       // tie beam
+        const ky = r.eave;                                                 // king post
+        const g = new T.BoxGeometry(0.12, r.ridge - ky, 0.12);
+        this._add(g, this._mat.post).position.set(...P(um, (r.ridge + ky) / 2, v));
+      });
+      (r.posts || []).forEach(([x, z]) => {
+        const h = yAt(r.axis === "x" ? z : x);
+        this._add(new T.BoxGeometry(0.14, h, 0.14), this._mat.post).position.set(x, h / 2, z);
+      });
+      return;
+    }
     // gable triangles at both wall lines
     [v0, v1].forEach((v) => {
       const g = new T.BufferGeometry();
@@ -1026,9 +1058,20 @@ class HouseReal extends HouseBase {
     let y = -Infinity;
     (this._house.roofs || []).forEach((r) => {
       if (r.type === "tent") {
-        const d = Math.hypot(pt[0] - r.center[0], pt[1] - r.center[1]);
-        const R = Math.max(...r.ring.map(([x, z]) => Math.hypot(x - r.center[0], z - r.center[1])));
-        if (d < R) y = Math.max(y, r.apex - (r.apex - r.base) * d / R);
+        const [cx, cz] = r.center, o = r.overhang ?? 0.5;
+        const ring = r.ring.map(([x, z]) => {
+          const d = Math.hypot(x - cx, z - cz), k = (d + o) / d;
+          return [cx + (x - cx) * k, cz + (z - cz) * k];
+        });
+        const px = pt[0] - cx, pz = pt[1] - cz;
+        ring.forEach((b, i) => {
+          const c = ring[(i + 1) % ring.length];
+          const bx = b[0] - cx, bz = b[1] - cz, qx = c[0] - cx, qz = c[1] - cz;
+          // barycentric weights of the point in triangle (apex, b, c)
+          const det = bx * qz - bz * qx;
+          const wb = (px * qz - pz * qx) / det, wc = (bx * pz - bz * px) / det;
+          if (wb >= -1e-6 && wc >= -1e-6 && wb + wc <= 1 + 1e-6) y = Math.max(y, r.apex - (r.apex - r.base) * (wb + wc));
+        });
       } else if (inRect(pt, [0, 1, 2, 3].map((i) => r.rect[i] + (i < 2 ? -1 : 1) * (r.overhang ?? 0.5)))) {
         const f = this._roofFrame(r);
         y = Math.max(y, f.yAt(r.axis === "x" ? pt[1] : pt[0]));
@@ -1091,7 +1134,21 @@ class HouseReal extends HouseBase {
       g.userData.room = id;
       this._rooms[id]?.windows.push(glass);
     };
-    const doors = this._house.doors || [];
+    // triangular pane with its apex at (cx, top, cz): gable windows and pointed arches
+    const triPane = (id, w, h, top, cx, cz, nx, nz) => {
+      const tri = (tw, th, m, off) => {
+        const g = new T.BufferGeometry();
+        g.setAttribute("position", new T.Float32BufferAttribute([-tw / 2, -th, 0, tw / 2, -th, 0, 0, 0, 0], 3));
+        g.computeVertexNormals();
+        return face(this._add(g, m, { cast: false }), cx, top, cz, nx, nz, off);
+      };
+      tri(w + 0.2, h + 0.1, mat.frame, 0.01).material.side = T.DoubleSide;
+      const glass = new T.MeshStandardMaterial({ color: 0x1c2733, roughness: 0.15, metalness: 0.4, side: T.DoubleSide,
+        clippingPlanes: [this._clip] });
+      tri(w, h, glass, 0.02).userData.room = id;
+      this._rooms[id]?.windows.push(glass);
+    };
+    const doors = this._house.doors || [], fixed = this._house.windows || [];
     shell.forEach((a, i) => {
       const b = shell[(i + 1) % shell.length];
       const dx = b[0] - a[0], dz = b[1] - a[1], len = Math.hypot(dx, dz);
@@ -1103,9 +1160,20 @@ class HouseReal extends HouseBase {
       const here = doors.filter((d) => off(d.at) < 0.3 && along(d.at) > -0.1 && along(d.at) < len + 0.1);
       here.forEach((d) => {
         face(this._add(new T.PlaneGeometry(d.width || 1.1, d.height || 2.15), mat.door, { cast: false }),
-          d.at[0], (d.height || 2.15) / 2, d.at[1], nx, nz, 0.02);
+          d.at[0], (d.sill || 0) + (d.height || 2.15) / 2, d.at[1], nx, nz, 0.02);
       });
-      const n = len > 7 ? Math.floor(len / 2.6) : len > 2.6 ? 2 : 1;
+      // windows given in house.windows replace the automatic ones of their floor on this wall
+      const mine = fixed.filter((w) => off(w.at) < 0.3 && along(w.at) > -0.1 && along(w.at) < len + 0.1);
+      mine.filter((w) => !w.none).forEach((w) => {
+        const f = w.floor || 0, h = w.height || 1.3, level = this._floors()[f]?.level || 0;
+        const room = this._roomAt([w.at[0] - nx * 0.7, w.at[1] - nz * 0.7], f);
+        const ww = w.width || 1.1, top = level + (w.sill ?? 0.85) + h;
+        pane(room?.id ?? null, ww, h, w.at[0], top - h / 2, w.at[1], nx, nz);
+        // pointed (church) window: a triangle on top of the rectangle
+        if (w.shape === "pointed") triPane(room?.id ?? null, ww, ww * 0.55, top + ww * 0.55, w.at[0], w.at[1], nx, nz);
+      });
+      const auto = (f) => !mine.some((w) => (w.floor || 0) === f);
+      const n = !auto(0) ? 0 : len > 7 ? Math.floor(len / 2.6) : len > 2.6 ? 2 : 1;
       for (let k = 0; k < n; k++) {
         const s = (k + 0.5) / n, cx = a[0] + dx * s, cz = a[1] + dz * s;
         if (here.some((d) => Math.abs(along(d.at) - s * len) < (d.width || 1.1) / 2 + 0.4)) continue;
@@ -1122,14 +1190,47 @@ class HouseReal extends HouseBase {
         const ends = r.axis === "x" ? [a[0], b[0]] : [a[1], b[1]];
         const gable = [f.v0, f.v1].find((v) => Math.abs(ends[0] - v) < 0.05 && Math.abs(ends[1] - v) < 0.05);
         if (gable === undefined) return;
-        if (r.windows !== "attic") for (const s of [0.28, 0.72]) {
+        if (r.windows !== "attic" && auto(1)) for (const s of [0.28, 0.72]) {
           const cx = a[0] + dx * s, cz = a[1] + dz * s;
           const room = this._roomAt([cx - nx * 0.7, cz - nz * 0.7], 1);
           if (room) pane(room.id, 0.95, 1.25, cx, upper + 1.55, cz, nx, nz);
         }
         const [mx, mz] = r.axis === "x" ? [gable, f.um] : [f.um, gable];
-        pane(null, 0.7, 0.55, mx, r.ridge - 1.9, mz, nx, nz);
+        triPane(null, 1.1, 0.52, r.ridge - 0.55, mx, mz, nx, nz);
       });
+    });
+    // dormers: roofs with windows: glazed get a triangular window filling each gable
+    (this._house.roofs || []).filter((r) => r.windows === "glazed" && r.type !== "tent").forEach((r) => {
+      const f = this._roofFrame(r), w = (f.u1 - f.u0) * 0.8, h = (r.ridge - r.eave) * 0.8;
+      [[f.v0, -1], [f.v1, 1]].forEach(([v, sgn]) => {
+        const [cx, cz] = r.axis === "x" ? [v, f.um] : [f.um, v];
+        const [nx, nz] = r.axis === "x" ? [sgn, 0] : [0, sgn];
+        const room = this._roomAt([cx - nx * 0.7, cz - nz * 0.7], 1);
+        triPane(room?.id ?? null, w, h, r.ridge - 0.12, cx, cz, nx, nz);
+      });
+    });
+    // roof windows: lie in the roof plane above w.at, glow with the room below
+    (this._house.roof_windows || []).forEach((w) => {
+      const [x, z] = w.at, e = 0.25, y = this._roofY(w.at);
+      if (!Number.isFinite(y)) return;
+      const gx = (this._roofY([x + e, z]) - this._roofY([x - e, z])) / (2 * e);
+      const gz = (this._roofY([x, z + e]) - this._roofY([x, z - e])) / (2 * e);
+      const n = new T.Vector3(-gx, 1, -gz).normalize();
+      const up = new T.Vector3(gx, gx * gx + gz * gz, gz).normalize();
+      const right = new T.Vector3().crossVectors(up, n);
+      const basis = new T.Matrix4().makeBasis(right, up, n);
+      const room = this._roomAt(w.at, w.floor ?? 1);
+      const put = (geo, m, off) => {
+        const mesh = this._add(geo, m, { cast: false });
+        mesh.quaternion.setFromRotationMatrix(basis);
+        mesh.position.set(x, y, z).addScaledVector(n, off);
+        return mesh;
+      };
+      const ww = w.width || 0.8, hh = w.height || 1.0;
+      put(new T.PlaneGeometry(ww + 0.12, hh + 0.12), mat.frame, 0.04);
+      const glass = new T.MeshStandardMaterial({ color: 0x1c2733, roughness: 0.1, metalness: 0.5, clippingPlanes: [this._clip] });
+      put(new T.PlaneGeometry(ww, hh), glass, 0.05).userData.room = room?.id;
+      if (room) this._rooms[room.id]?.windows.push(glass);
     });
   }
 
@@ -1276,25 +1377,54 @@ class HouseReal extends HouseBase {
         extrude(0.12, 0.25, mat.wood);
         if (z.roof) extrude(0.08, z.roof, mat.shedRoof);
       } else if (kind === "building") {
-        // garden house: wooden walls and a shallow saddle roof along its long side
-        const h = z.height || 2.3;
-        extrude(h, 0, mat.wood);
+        // garden house: walls and a saddle roof along its long side; with porch: <deck zone id>
+        // the roof runs on over that deck and rests on posts at its far end
+        const h = z.height || 2.3, brick = z.walls === "brick";
+        extrude(h, 0, brick ? mat.brick : mat.wood);
         const edges = p.map((a, i) => [a, p[(i + 1) % p.length]]);
         const elen = ([a, b]) => Math.hypot(b[0] - a[0], b[1] - a[1]);
         const e = [...edges].sort((u, v) => elen(v) - elen(u))[0];
-        const len = elen(e) + 0.6, wid = Math.min(...edges.map(elen)) + 0.6, rise = wid / 2 * Math.tan(0.4);
+        const ang = Math.atan2(e[1][1] - e[0][1], e[1][0] - e[0][0]), ex = Math.cos(ang), ez = Math.sin(ang);
+        const al = ([x, y]) => x * ex + y * ez, ac = ([x, y]) => y * ex - x * ez;
+        const porch = z.porch && this._zones().find((q) => q.id === z.porch);
+        const pp = porch ? outline(porch) : [];
+        const span = (pts, f) => [Math.min(...pts.map(f)), Math.max(...pts.map(f))];
+        const [b0, b1] = span(p, al), [c0, c1] = span(p, ac), [r0, r1] = span([...p, ...pp], al);
+        const len = r1 - r0 + 0.6, w = c1 - c0, wid = w + 0.6, rise = (wid / 2) * Math.tan(0.4);
+        const am = (r0 + r1) / 2, cm = (c0 + c1) / 2;
+        const roofMat = brick ? mat.roof : mat.shedRoof;
         const roof = new T.Group();
         [-1, 1].forEach((s) => {
-          const pl = new T.Mesh(new T.PlaneGeometry(len, Math.hypot(wid / 2, rise)), mat.shedRoof);
+          const g = new T.PlaneGeometry(len, Math.hypot(wid / 2, rise));
+          const uv = g.attributes.uv;
+          for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * len, uv.getY(i) * Math.hypot(wid / 2, rise));
+          const pl = new T.Mesh(g, roofMat);
           pl.rotation.x = -Math.PI / 2 + s * 0.4;
           pl.position.set(0, rise / 2, s * wid / 4);
           pl.castShadow = pl.receiveShadow = true;
           roof.add(pl);
         });
-        const [cx, cz] = centroid(p);
-        roof.position.set(cx, h, cz);
-        roof.rotation.y = -Math.atan2(e[1][1] - e[0][1], e[1][0] - e[0][0]);
+        // gable triangles at the house's own ends, in the wall material
+        [b0, b1].forEach((a) => {
+          const g = new T.BufferGeometry();
+          g.setAttribute("position", new T.Float32BufferAttribute([a - am, 0, -w / 2, a - am, 0, w / 2, a - am, rise * w / wid, 0], 3));
+          g.computeVertexNormals();
+          const m = new T.Mesh(worldUV(g), new T.MeshStandardMaterial({ map: (brick ? mat.brick : mat.wood).map, side: T.DoubleSide }));
+          m.castShadow = m.receiveShadow = true;
+          roof.add(m);
+        });
+        roof.position.set(am * ex - cm * ez, h, am * ez + cm * ex);
+        roof.rotation.y = -ang;
         this._scene.add(roof);
+        if (porch) {
+          // posts at the porch corners furthest from the house
+          const far = Math.abs(r0 - b0) > Math.abs(r1 - b1) ? r0 : r1;
+          pp.filter((q) => Math.abs(al(q) - far) < 0.4).forEach(([x, y]) => {
+            const base = 0.37, q = [x - (far === r0 ? -0.25 : 0.25) * ex, y - (far === r0 ? -0.25 : 0.25) * ez];
+            const pm = this._add(new T.BoxGeometry(0.14, h - base, 0.14), mat.post);
+            pm.position.set(q[0], base + (h - base) / 2, q[1]);
+          });
+        }
       } else if (z.roof) {
         // covered terrace: a canopy on slim posts
         extrude(0.1, z.roof, mat.canopy);

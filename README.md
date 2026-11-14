@@ -46,8 +46,10 @@ Alle Maße sind Meter auf dem Grundriss: `x` nach rechts, `y` nach unten (im rea
 | `shell` | Außenkante der Außenwände als Punktliste. Nur für die realistische Darstellung. |
 | `wall_height` | Höhe der Außenwände bis zur Traufe. |
 | `wall_zones` | Abweichende Wandhöhen: `{ rect: [x0, y0, x1, y1], height }` oder `{ circle: [x, y, r], height }`. |
-| `roofs` | `{ type: gable, rect, axis: x\|z, eave, ridge, overhang, windows }` für Satteldächer (`rect` = Wandrechteck, `axis` = Firstrichtung, `windows: true` setzt Fenster in die Giebel, `windows: attic` nur ein kleines Giebelfenster), `{ type: tent, center, ring, base, apex, overhang }` für Zeltdächer. Ein Quergiebel ist ein Satteldach mit `axis: x`, dessen `rect` bis in das Hauptdach hineinreicht. |
-| `doors` | `{ at: [x, y], width, height }`, Türen auf der Außenwand. |
+| `roofs` | `{ type: gable, rect, axis: x\|z, eave, ridge, overhang, windows }` für Satteldächer (`rect` = Wandrechteck, `axis` = Firstrichtung). `windows: true` setzt zwei Fenster und ein dreieckiges Giebelfenster unter den First, `windows: attic` nur das Giebelfenster, `windows: glazed` verglast den ganzen Giebel (Gauben). `open: true` und `posts: [[x, y], …]` ergeben ein offenes Dach auf Pfosten (Terrasse, Carport). `{ type: tent, center, ring, base, apex, overhang }` für Zeltdächer; `ring` darf vom Mauerwerk abweichen (achteckiges Dach über runder Wand). Quergiebel und Gauben sind Satteldächer, deren `rect` bis in das Hauptdach hineinreicht. |
+| `doors` | `{ at: [x, y], width, height, sill }`, Türen auf der Außenwand; `sill` hebt eine Tür an (z. B. Bodentür im Giebel). |
+| `windows` | Feste Fenster statt der automatischen: `{ at: [x, y], floor, width, height, sill, shape }`. `at` liegt auf der Außenwand, `sill` ist die Brüstungshöhe über dem Geschossboden, `shape: pointed` gibt eine Spitze wie beim Kirchenfenster. Sobald eine Wand ein festes Fenster eines Geschosses hat, entfallen dort die automatischen. `{ at, none: true }` schaltet sie ohne Ersatz ab. |
+| `roof_windows` | Dachflächenfenster: `{ at: [x, y], width, height, floor }`. Sie liegen in der Dachfläche über `at` und leuchten mit dem Raum darunter. |
 | `ortho` | Luftbild als Boden: `{ url, corners: [TL, TR, BR, BL], clip }` in Grundriss-Metern. Der Rand blendet weich in den Rasen über. `clip` (Punktliste, optional) zeigt nur das eigene Grundstück, Nachbarn werden ausgeblendet. |
 | `plants` | Bäume und Büsche: `{ at: [x, y], r, h, kind: tree \| conifer \| shrub, color }`. `r` ist der Kronenradius, `h` die Höhe in Metern, `color` optional. |
 | `materials` | Optional: `brick` (Liste von Klinkerfarben), `mortar`, `roof` (drei Farbtöne hell → dunkel). |
@@ -76,7 +78,7 @@ Flächen und Objekte rund ums Haus. Jede Zone hat `id`, optional `name`, eine Fo
 | `kind` | Darstellung |
 |---|---|
 | `lawn`, `paved` (Standard), `road`, `water`, `deck` | Fläche |
-| `building` | Nebengebäude mit Satteldach, `height` |
+| `building` | Nebengebäude mit Satteldach, `height`. `walls: brick` mauert es in Klinker mit Ziegeldach, `porch: <id einer deck-Zone>` zieht das Dach über diese Veranda und stellt Pfosten darunter. |
 | `hedge` | Hecke, `height` |
 | `berm` | Erdwall entlang `line` (Mittellinie statt Form): `height`, `width` (Kronenbreite), `base` (Fußbreite). Pflanzen darauf stehen auf dem Wall, das Luftbild liegt darüber. |
 
