@@ -5,7 +5,7 @@
  * The house geometry lives in the card config, never in this file.
  * SPDX-License-Identifier: MIT
  */
-const VERSION = "1.2.0";
+const VERSION = "1.2.1";
 const THREE_URL = new URL("./three.module.min.js", import.meta.url).href;
 const WARM = [255, 183, 92];
 
@@ -893,13 +893,14 @@ class HouseReal extends HouseBase {
       og.setIndex([0, 1, 2, 0, 2, 3]);
       og.computeVertexNormals();
       // the photo fades out at its edges (and outside ortho.clip) into the lawn
-      const ortho = new T.MeshStandardMaterial({ color: 0xe2e2e2, roughness: 1, transparent: true,
+      // lawn coloured until the photo has loaded (or if it is missing)
+      const ortho = new T.MeshStandardMaterial({ color: 0x6b7a4c, roughness: 1, transparent: true,
         alphaMap: orthoMask(T, house.ortho), depthWrite: false });
       this._orthoMats = [ortho];
       new T.TextureLoader().load(new URL(house.ortho.url, location.origin).href, (t) => {
         t.colorSpace = T.SRGBColorSpace;
         t.anisotropy = this._renderer.capabilities.getMaxAnisotropy();
-        this._orthoMats.forEach((m) => { m.map = t; m.needsUpdate = true; });
+        this._orthoMats.forEach((m) => { m.map = t; m.color.set(0xe2e2e2); m.needsUpdate = true; });
         this._dirty();
       });
       const m = new T.Mesh(og, ortho);
@@ -1227,8 +1228,9 @@ class HouseReal extends HouseBase {
       const uv = [];
       for (let i = 0; i < pos.length; i += 3) uv.push(...this._orthoUV([pos[i], pos[i + 2]]));
       g.setAttribute("uv", new T.Float32BufferAttribute(uv, 2));
-      m = new T.MeshStandardMaterial({ color: 0xe2e2e2, roughness: 1, side: T.DoubleSide,
-        transparent: true, alphaTest: 0.02, alphaMap: this._orthoMats[0].alphaMap });
+      const o = this._orthoMats[0];
+      m = new T.MeshStandardMaterial({ color: o.color.clone(), map: o.map, roughness: 1, side: T.DoubleSide,
+        transparent: true, alphaTest: 0.02, alphaMap: o.alphaMap });
       this._orthoMats.push(m);
     } else {
       worldUV(g);
