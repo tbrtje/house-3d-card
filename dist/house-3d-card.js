@@ -5,7 +5,7 @@
  * The house geometry lives in the card config, never in this file.
  * SPDX-License-Identifier: MIT
  */
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const THREE_URL = new URL("./three.module.min.js", import.meta.url).href;
 const WARM = [255, 183, 92];
 
@@ -591,7 +591,41 @@ const PAINT = {
       g.fillRect(Math.random() * s, Math.random() * s, 3 + Math.random() * 5, 3 + Math.random() * 5);
     }
   },
+  // light grey leaves; each plant tints it with its own colour
+  foliage: (g, s) => {
+    g.fillStyle = "#b8b8b8"; g.fillRect(0, 0, s, s);
+    for (let i = 0; i < 2600; i++) {
+      g.fillStyle = ["#f0f0f0", "#a0a0a0", "#dadada", "#848484", "#c8c8c8"][i % 5];
+      g.beginPath();
+      g.ellipse(Math.random() * s, Math.random() * s, 1.5 + Math.random() * 2.5, 1 + Math.random() * 1.5, Math.random() * 3, 0, 7);
+      g.fill();
+    }
+  },
 };
+
+// small deterministic random generator, so plants look the same on every load
+function seeded(a) {
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// lumpy unit sphere for tree crowns and shrubs
+function crownGeometry(T) {
+  const g = new T.SphereGeometry(1, 16, 11), pos = g.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const n = Math.sin(3.1 * x + 1.7) * Math.sin(2.7 * y + 0.4) * Math.sin(3.3 * z + 2.1)
+      + 0.5 * Math.sin(7.3 * x + 0.3) * Math.sin(6.1 * z + 1.2) * Math.sin(5.7 * y + 2.5);
+    const f = 1 + 0.2 * n;
+    pos.setXYZ(i, x * f, (y < -0.2 ? y * 0.8 : y) * f, z * f);
+  }
+  g.computeVertexNormals();
+  return g;
+}
 
 // planar UVs in metres, chosen per face from its normal
 function worldUV(geo) {
@@ -792,7 +826,7 @@ class HouseReal extends HouseBase {
     this._mat = mat;
 
     // ground: optional orthophoto quad over a large lawn plane
-    const lawn = new T.Mesh(new T.PlaneGeometry(400, 400), new T.MeshStandardMaterial({ color: 0x55703f, roughness: 1 }));
+    const lawn = new T.Mesh(new T.PlaneGeometry(400, 400), new T.MeshStandardMaterial({ color: house.ortho ? 0x6b7a4c : 0x55703f, roughness: 1 }));
     lawn.rotation.x = -Math.PI / 2;
     lawn.position.set(this._center[0], -0.03, this._center[2]);
     lawn.receiveShadow = true;
@@ -804,15 +838,26 @@ class HouseReal extends HouseBase {
       og.setAttribute("uv", new T.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
       og.setIndex([0, 1, 2, 0, 2, 3]);
       og.computeVertexNormals();
-      const ortho = new T.MeshStandardMaterial({ color: 0xffffff, roughness: 1 });
+      // the photo fades out at its edges instead of ending in a hard border
+      const fade = document.createElement("canvas");
+      fade.width = fade.height = 64;
+      const fg = fade.getContext("2d");
+      fg.fillStyle = "#000"; fg.fillRect(0, 0, 64, 64);
+      for (let i = 0; i < 8; i++) {
+        fg.fillStyle = `rgb(${(i + 1) * 32 - 1},${(i + 1) * 32 - 1},${(i + 1) * 32 - 1})`;
+        fg.fillRect(i, i, 64 - 2 * i, 64 - 2 * i);
+      }
+      const alpha = new T.CanvasTexture(fade);
+      const ortho = new T.MeshStandardMaterial({ color: 0xe2e2e2, roughness: 1, transparent: true, alphaMap: alpha, depthWrite: false });
       new T.TextureLoader().load(new URL(house.ortho.url, location.origin).href, (t) => {
         t.colorSpace = T.SRGBColorSpace;
-        t.anisotropy = 8;
+        t.anisotropy = this._renderer.capabilities.getMaxAnisotropy();
         ortho.map = t;
         ortho.needsUpdate = true;
         this._dirty();
       });
       const m = new T.Mesh(og, ortho);
+      m.renderOrder = -1;
       m.receiveShadow = true;
       scene.add(m);
     }
@@ -822,18 +867,26 @@ class HouseReal extends HouseBase {
     this._buildRooms();
     if (house.shell) this._buildWindows();
     this._buildOutdoor();
+    this._buildPlants();
 
     this._hemi = new T.HemisphereLight(0xbfd8ff, 0x4a5a3a, 1);
     scene.add(this._hemi);
     const sun = new T.DirectionalLight(0xffffff, 3);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
-    Object.assign(sun.shadow.camera, { left: -32, right: 32, top: 32, bottom: -32, near: 1, far: 160 });
+    const ext = this._extent();
+    Object.assign(sun.shadow.camera, { left: -ext, right: ext, top: ext, bottom: -ext, near: 1, far: 300 });
     sun.shadow.bias = -0.0004;
     sun.shadow.normalBias = 0.02;
     sun.target.position.set(...this._center);
     scene.add(sun, sun.target);
     this._sun = sun;
+    // cool moonlight, so the house stays readable at night
+    const moon = new T.DirectionalLight(0x9db4ff, 0);
+    moon.position.set(this._center[0] - 40, 70, this._center[2] + 30);
+    moon.target.position.set(...this._center);
+    scene.add(moon, moon.target);
+    this._moon = moon;
     this._resize();
     this._applyMode();
   }
@@ -1032,6 +1085,70 @@ class HouseReal extends HouseBase {
     });
   }
 
+  // half size of the area that receives sun shadows: house, zones and plants
+  _extent() {
+    const [cx, , cz] = this._center;
+    const pts = [...(this._house.shell || []), ...this._zones().flatMap((z) => outline(z)),
+      ...(this._house.plants || []).map((p) => p.at)];
+    const d = Math.max(0, ...pts.map(([x, y]) => Math.max(Math.abs(x - cx), Math.abs(y - cz))));
+    return Math.max(32, Math.min(70, d + 4));
+  }
+
+  // trees, conifers and shrubs as instanced meshes
+  _buildPlants() {
+    const T = this._T, plants = this._house.plants || [];
+    if (!plants.length) return;
+    const rnd = seeded(7);
+    const foliage = canvasTex(T, 256, PAINT.foliage, 1);
+    foliage.repeat.set(6, 3);
+    const leaves = new T.MeshStandardMaterial({ map: foliage, roughness: 0.95 });
+    const bark = new T.MeshStandardMaterial({ color: 0x5a4636, roughness: 1 });
+    const tint = { tree: "#4f6e3b", conifer: "#2e4a31", shrub: "#58763f" };
+    const count = (k) => plants.filter((p) => (p.kind || "tree") === k).length;
+    // big trees get two side lobes, so crowns are not plain balls
+    const crowns = new T.InstancedMesh(crownGeometry(T), leaves, count("tree") * 3 + count("shrub"));
+    const cones = new T.InstancedMesh(new T.ConeGeometry(1, 1, 10), leaves, Math.max(1, count("conifer")));
+    const trunks = new T.InstancedMesh(new T.CylinderGeometry(0.7, 1, 1, 6), bark, Math.max(1, count("tree") + count("conifer")));
+    const m = new T.Matrix4(), q = new T.Quaternion(), up = new T.Vector3(0, 1, 0), col = new T.Color();
+    const n = { crown: 0, cone: 0, trunk: 0 };
+    const put = (mesh, key, x, y, z, sx, sy, sz, c) => {
+      q.setFromAxisAngle(up, rnd() * 6.283);
+      m.compose(new T.Vector3(x, y, z), q, new T.Vector3(sx, sy, sz));
+      mesh.setMatrixAt(n[key], m);
+      if (c) mesh.setColorAt(n[key], c);
+      n[key]++;
+    };
+    plants.forEach((p) => {
+      const kind = p.kind || "tree", [x, z] = p.at, r = p.r || 1.5;
+      const j = 0.9 + 0.2 * rnd();
+      col.set(p.color || tint[kind] || tint.tree).offsetHSL(0, 0, (rnd() - 0.5) * 0.06);
+      if (kind === "shrub") {
+        const h = p.h || r * 1.4;
+        put(crowns, "crown", x, h / 2 - 0.05, z, r * j, h / 2, r * j, col);
+      } else if (kind === "conifer") {
+        const h = p.h || r * 4;
+        put(cones, "cone", x, h * 0.12 + h * 0.44, z, r, h * 0.88, r, col);
+        put(trunks, "trunk", x, h * 0.075, z, 0.12, h * 0.15, 0.12);
+      } else {
+        const h = p.h || r * 2.4 + 2.5, cy = Math.max(Math.min(r * 1.1, h * 0.45), h * 0.36), stem = h - cy;
+        put(crowns, "crown", x, h - cy, z, r * j, cy, r * (2 - j), col);
+        if (r > 2.2) for (let k = 0; k < 2; k++) {
+          const a = rnd() * 6.283, d = r * 0.45;
+          put(crowns, "crown", x + Math.cos(a) * d, h - cy * (1.25 + 0.2 * rnd()), z + Math.sin(a) * d,
+            r * 0.62, cy * 0.62, r * 0.62, col.clone().offsetHSL(0, 0, (rnd() - 0.5) * 0.05));
+        }
+        put(trunks, "trunk", x, stem / 2, z, 0.06 * r + 0.08, stem, 0.06 * r + 0.08);
+      }
+    });
+    [crowns, cones, trunks].forEach((mesh, i) => {
+      mesh.count = [n.crown, n.cone, n.trunk][i];
+      mesh.castShadow = mesh.receiveShadow = true;
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      this._scene.add(mesh);
+    });
+  }
+
   _buildOutdoor() {
     const T = this._T, mat = this._mat;
     this._zoneLights = [];
@@ -1113,11 +1230,13 @@ class HouseReal extends HouseBase {
     const right = E * Math.cos(b) - N * Math.sin(b), up = E * Math.sin(b) + N * Math.cos(b);
     const v = new T.Vector3(right, Math.max(0.08, Math.sin(el)), -up);
     const day = Math.max(0, Math.min(1, elev / 12 + 0.3)), night = 1 - day;
-    this._sun.position.copy(v.normalize().multiplyScalar(80)).add(new T.Vector3(...this._center));
+    this._sun.position.copy(v.normalize().multiplyScalar(140)).add(new T.Vector3(...this._center));
     this._sun.intensity = 3.2 * day;
     this._sun.color.setHSL(0.09, 0.5 * night + 0.1, 0.9);
-    this._hemi.intensity = 0.45 + 1.35 * day;
-    const sky = new T.Color().lerpColors(new T.Color(0x0b1226), new T.Color(0xa9cbea), day);
+    this._moon.intensity = 1.1 * night;
+    this._hemi.intensity = 0.8 + 1.0 * day;
+    this._hemi.color.lerpColors(new T.Color(0x8ea8dc), new T.Color(0xbfd8ff), day);
+    const sky = new T.Color().lerpColors(new T.Color(0x1a2644), new T.Color(0xa9cbea), day);
     this._scene.background = sky;
     this._scene.fog = new T.Fog(sky, 90, 260);
     let lit = 0;
