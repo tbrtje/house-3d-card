@@ -3,7 +3,7 @@
 
 Usage:
   python3 plants_from_ortho.py ortho.jpg --corners "TL_x,TL_y TR_x,TR_y BR_x,BR_y BL_x,BL_y" \
-      [--exclude "x,y x,y x,y ..."]... [--preview preview.png] > plants.json
+      [--exclude "x,y x,y x,y ..."]... [--clip "x,y ..."] [--preview preview.png] > plants.json
 
 The corners are the same as `house.ortho.corners` (floor plan metres).
 Pass the house outline and modelled objects (garden house, pond, ...) with
@@ -34,6 +34,7 @@ def main():
     ap.add_argument("image")
     ap.add_argument("--corners", required=True)
     ap.add_argument("--exclude", action="append", default=[])
+    ap.add_argument("--clip", help="keep only plants inside this polygon (the own plot)")
     ap.add_argument("--max", type=int, default=400, help="maximum number of plants")
     ap.add_argument("--preview")
     a = ap.parse_args()
@@ -65,6 +66,10 @@ def main():
     for poly in a.exclude:
         d.polygon([tuple(to_px(p)) for p in pairs(poly)], fill=1)
     m &= ~np.asarray(keep, bool)
+    if a.clip:
+        plot = Image.new("L", (wid, hgt), 0)
+        ImageDraw.Draw(plot).polygon([tuple(to_px(p)) for p in pairs(a.clip)], fill=1)
+        m &= np.asarray(plot, bool)
     lab, n = ndi.label(m)
     sizes = ndi.sum(m, lab, range(1, n + 1))
     m = np.isin(lab, 1 + np.nonzero(sizes >= 8)[0])

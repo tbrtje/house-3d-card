@@ -5,7 +5,7 @@
  * The house geometry lives in the card config, never in this file.
  * SPDX-License-Identifier: MIT
  */
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const THREE_URL = new URL("./three.module.min.js", import.meta.url).href;
 const WARM = [255, 183, 92];
 
@@ -49,7 +49,29 @@ const rect = (r) => [[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]];
 const inRect = ([x, y], r) => x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3];
 const ellipse = ([cx, cy, rx, ry], n = 28) => Array.from({ length: n }, (_, i) =>
   [cx + rx * Math.cos((i / n) * 2 * Math.PI), cy + ry * Math.sin((i / n) * 2 * Math.PI)]);
-const outline = (z) => z.poly || (z.ellipse ? ellipse(z.ellipse) : rect(z.rect));
+// a berm (earth wall) is a centre line with a base width; its footprint follows the line
+const lineNormals = (line) => line.map((c, i) => {
+  const a = line[Math.max(0, i - 1)], b = line[Math.min(line.length - 1, i + 1)];
+  const l = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+  return [-(b[1] - a[1]) / l, (b[0] - a[0]) / l];
+});
+const strip = (line, w) => {
+  const n = lineNormals(line);
+  return [...line.map((c, i) => [c[0] + n[i][0] * w, c[1] + n[i][1] * w]),
+    ...line.map((c, i) => [c[0] - n[i][0] * w, c[1] - n[i][1] * w]).reverse()];
+};
+const outline = (z) => z.poly || (z.line ? strip(z.line, (z.base || 8) / 2) :
+  z.ellipse ? ellipse(z.ellipse) : rect(z.rect));
+// distance from a point to a polyline
+const lineDist = ([x, y], line) => {
+  let d = Infinity;
+  for (let i = 1; i < line.length; i++) {
+    const a = line[i - 1], dx = line[i][0] - a[0], dy = line[i][1] - a[1];
+    const t = Math.max(0, Math.min(1, ((x - a[0]) * dx + (y - a[1]) * dy) / (dx * dx + dy * dy || 1)));
+    d = Math.min(d, Math.hypot(x - a[0] - t * dx, y - a[1] - t * dy));
+  }
+  return d;
+};
 // temperature → hue: 16 °C blue … 26 °C red
 const tempColor = (t) => `hsl(${220 - Math.max(0, Math.min(1, (t - 16) / 10)) * 220} 75% 55%)`;
 const bounds = (rooms) => {
@@ -366,7 +388,7 @@ class HouseSchematic extends HouseBase {
     // outdoor zones: flat ground (lawn, road, paved, water, deck) or solid
     // objects with walls and a top (building, hedge); roof adds a canopy
     this._zones().forEach((z) => {
-      const kind = z.kind || "paved";
+      const kind = z.kind === "berm" ? "lawn" : z.kind || "paved";
       const p = outline(z);
       const solidObj = kind === "building" || kind === "hedge";
       const fl = this._plane(outside, p, solidObj ? 0 : S_Z[kind] ?? S_Z.paved, z.id);
@@ -539,6 +561,29 @@ class HouseSchematic extends HouseBase {
 // =====================================================================
 // Realistic renderer: three.js, loaded lazily from next to this file
 // =====================================================================
+// alpha mask for the aerial photo: soft outer edge and an optional clip
+// polygon in plan metres (e.g. the own plot, so neighbours stay hidden)
+function orthoMask(T, { corners: [tl, tr, , bl], clip }) {
+  const N = 512, c = document.createElement("canvas");
+  c.width = c.height = N;
+  const g = c.getContext("2d"), img = g.createImageData(N, N);
+  const w = Math.hypot(tr[0] - tl[0], tr[1] - tl[1]), h = Math.hypot(bl[0] - tl[0], bl[1] - tl[1]);
+  const ring = clip && [...clip, clip[0]];
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const u = (i + 0.5) / N, v = (j + 0.5) / N;
+    let a = Math.min(u * w, (1 - u) * w, v * h, (1 - v) * h) / 6;
+    if (clip && a > 0) {
+      const p = [tl[0] + (tr[0] - tl[0]) * u + (bl[0] - tl[0]) * v, tl[1] + (tr[1] - tl[1]) * u + (bl[1] - tl[1]) * v];
+      a = Math.min(a, inside(p, clip) ? lineDist(p, ring) / 1.2 : 0);
+    }
+    const k = (j * N + i) * 4;
+    img.data[k] = img.data[k + 1] = img.data[k + 2] = Math.max(0, Math.min(1, a)) * 255;
+    img.data[k + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  return new T.CanvasTexture(c);
+}
+
 function canvasTex(T, size, draw, metres) {
   const c = document.createElement("canvas");
   c.width = c.height = size;
@@ -792,6 +837,8 @@ class HouseReal extends HouseBase {
     const scene = new T.Scene();
     this._scene = scene;
     this._rooms = {};
+    this._orthoUV = null;
+    this._orthoMats = [];
     const b = bounds(house.rooms.length ? house.rooms : [{ p: [[0, 0], [10, 10]] }]);
     this._center = [(b[0] + b[2]) / 2, 0, (b[1] + b[3]) / 2];
     const clip = [this._clip];
@@ -833,27 +880,26 @@ class HouseReal extends HouseBase {
     scene.add(lawn);
     if (house.ortho?.url && house.ortho.corners) {
       const [tl, tr, br, bl] = house.ortho.corners;
+      // plan point -> photo UV, also used to drape the photo over berms
+      const ux = [tr[0] - tl[0], tr[1] - tl[1]], vy = [bl[0] - tl[0], bl[1] - tl[1]];
+      const det = ux[0] * vy[1] - ux[1] * vy[0];
+      this._orthoUV = ([x, z]) => {
+        const dx = x - tl[0], dz = z - tl[1];
+        return [(dx * vy[1] - dz * vy[0]) / det, 1 - (ux[0] * dz - ux[1] * dx) / det];
+      };
       const og = new T.BufferGeometry();
       og.setAttribute("position", new T.Float32BufferAttribute([bl, br, tr, tl].flatMap(([x, z]) => [x, 0, z]), 3));
       og.setAttribute("uv", new T.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
       og.setIndex([0, 1, 2, 0, 2, 3]);
       og.computeVertexNormals();
-      // the photo fades out at its edges instead of ending in a hard border
-      const fade = document.createElement("canvas");
-      fade.width = fade.height = 64;
-      const fg = fade.getContext("2d");
-      fg.fillStyle = "#000"; fg.fillRect(0, 0, 64, 64);
-      for (let i = 0; i < 8; i++) {
-        fg.fillStyle = `rgb(${(i + 1) * 32 - 1},${(i + 1) * 32 - 1},${(i + 1) * 32 - 1})`;
-        fg.fillRect(i, i, 64 - 2 * i, 64 - 2 * i);
-      }
-      const alpha = new T.CanvasTexture(fade);
-      const ortho = new T.MeshStandardMaterial({ color: 0xe2e2e2, roughness: 1, transparent: true, alphaMap: alpha, depthWrite: false });
+      // the photo fades out at its edges (and outside ortho.clip) into the lawn
+      const ortho = new T.MeshStandardMaterial({ color: 0xe2e2e2, roughness: 1, transparent: true,
+        alphaMap: orthoMask(T, house.ortho), depthWrite: false });
+      this._orthoMats = [ortho];
       new T.TextureLoader().load(new URL(house.ortho.url, location.origin).href, (t) => {
         t.colorSpace = T.SRGBColorSpace;
         t.anisotropy = this._renderer.capabilities.getMaxAnisotropy();
-        ortho.map = t;
-        ortho.needsUpdate = true;
+        this._orthoMats.forEach((m) => { m.map = t; m.needsUpdate = true; });
         this._dirty();
       });
       const m = new T.Mesh(og, ortho);
@@ -973,20 +1019,21 @@ class HouseReal extends HouseBase {
     this._add(g, this._mat.roof);
   }
 
-  // underside height of the lowest roof above a plan point
+  // underside height of the roofs above a plan point; where roofs overlap
+  // (cross gables) the higher one is the ceiling
   _roofY(pt) {
-    let y = Infinity;
+    let y = -Infinity;
     (this._house.roofs || []).forEach((r) => {
       if (r.type === "tent") {
         const d = Math.hypot(pt[0] - r.center[0], pt[1] - r.center[1]);
         const R = Math.max(...r.ring.map(([x, z]) => Math.hypot(x - r.center[0], z - r.center[1])));
-        if (d < R) y = Math.min(y, r.apex - (r.apex - r.base) * d / R);
+        if (d < R) y = Math.max(y, r.apex - (r.apex - r.base) * d / R);
       } else if (inRect(pt, [0, 1, 2, 3].map((i) => r.rect[i] + (i < 2 ? -1 : 1) * (r.overhang ?? 0.5)))) {
         const f = this._roofFrame(r);
-        y = Math.min(y, f.yAt(r.axis === "x" ? pt[1] : pt[0]));
+        y = Math.max(y, f.yAt(r.axis === "x" ? pt[1] : pt[0]));
       }
     });
-    return y;
+    return y === -Infinity ? Infinity : y;
   }
 
   _buildRooms() {
@@ -1074,7 +1121,7 @@ class HouseReal extends HouseBase {
         const ends = r.axis === "x" ? [a[0], b[0]] : [a[1], b[1]];
         const gable = [f.v0, f.v1].find((v) => Math.abs(ends[0] - v) < 0.05 && Math.abs(ends[1] - v) < 0.05);
         if (gable === undefined) return;
-        for (const s of [0.28, 0.72]) {
+        if (r.windows !== "attic") for (const s of [0.28, 0.72]) {
           const cx = a[0] + dx * s, cz = a[1] + dz * s;
           const room = this._roomAt([cx - nx * 0.7, cz - nz * 0.7], 1);
           if (room) pane(room.id, 0.95, 1.25, cx, upper + 1.55, cz, nx, nz);
@@ -1119,25 +1166,25 @@ class HouseReal extends HouseBase {
       n[key]++;
     };
     plants.forEach((p) => {
-      const kind = p.kind || "tree", [x, z] = p.at, r = p.r || 1.5;
+      const kind = p.kind || "tree", [x, z] = p.at, r = p.r || 1.5, gy = this._groundY(p.at);
       const j = 0.9 + 0.2 * rnd();
       col.set(p.color || tint[kind] || tint.tree).offsetHSL(0, 0, (rnd() - 0.5) * 0.06);
       if (kind === "shrub") {
         const h = p.h || r * 1.4;
-        put(crowns, "crown", x, h / 2 - 0.05, z, r * j, h / 2, r * j, col);
+        put(crowns, "crown", x, gy + h / 2 - 0.05, z, r * j, h / 2, r * j, col);
       } else if (kind === "conifer") {
         const h = p.h || r * 4;
-        put(cones, "cone", x, h * 0.12 + h * 0.44, z, r, h * 0.88, r, col);
-        put(trunks, "trunk", x, h * 0.075, z, 0.12, h * 0.15, 0.12);
+        put(cones, "cone", x, gy + h * 0.12 + h * 0.44, z, r, h * 0.88, r, col);
+        put(trunks, "trunk", x, gy + h * 0.075, z, 0.12, h * 0.15, 0.12);
       } else {
         const h = p.h || r * 2.4 + 2.5, cy = Math.max(Math.min(r * 1.1, h * 0.45), h * 0.36), stem = h - cy;
-        put(crowns, "crown", x, h - cy, z, r * j, cy, r * (2 - j), col);
+        put(crowns, "crown", x, gy + h - cy, z, r * j, cy, r * (2 - j), col);
         if (r > 2.2) for (let k = 0; k < 2; k++) {
           const a = rnd() * 6.283, d = r * 0.45;
-          put(crowns, "crown", x + Math.cos(a) * d, h - cy * (1.25 + 0.2 * rnd()), z + Math.sin(a) * d,
+          put(crowns, "crown", x + Math.cos(a) * d, gy + h - cy * (1.25 + 0.2 * rnd()), z + Math.sin(a) * d,
             r * 0.62, cy * 0.62, r * 0.62, col.clone().offsetHSL(0, 0, (rnd() - 0.5) * 0.05));
         }
-        put(trunks, "trunk", x, stem / 2, z, 0.06 * r + 0.08, stem, 0.06 * r + 0.08);
+        put(trunks, "trunk", x, gy + stem / 2, z, 0.06 * r + 0.08, stem, 0.06 * r + 0.08);
       }
     });
     [crowns, cones, trunks].forEach((mesh, i) => {
@@ -1147,6 +1194,58 @@ class HouseReal extends HouseBase {
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
       this._scene.add(mesh);
     });
+  }
+
+  // earth wall along z.line with a trapezoid cross-section, draped with the aerial photo
+  _buildBerm(z) {
+    const T = this._T, h = z.height || 2, top = (z.width ?? 2) / 2, base = (z.base || 8) / 2;
+    // the ends run out with the same slope as the sides
+    const ramp = (pa, pb) => {
+      const l = Math.hypot(pb[0] - pa[0], pb[1] - pa[1]) || 1, k = (base - top) / l;
+      return [pb[0] + (pb[0] - pa[0]) * k, pb[1] + (pb[1] - pa[1]) * k];
+    };
+    const line = [ramp(z.line[1], z.line[0]), ...z.line, ramp(z.line.at(-2), z.line.at(-1))];
+    const n = lineNormals(line);
+    const pos = [], idx = [];
+    line.forEach((c, i) => {
+      const end = i === 0 || i === line.length - 1;
+      [[-base, 0], [-top, h], [top, h], [base, 0]].forEach(([o, y]) => {
+        const oo = end ? Math.sign(o) * Math.min(Math.abs(o), top) : o;
+        pos.push(c[0] + n[i][0] * oo, end ? 0 : y, c[1] + n[i][1] * oo);
+      });
+    });
+    for (let i = 0; i < line.length - 1; i++) for (let k = 0; k < 3; k++) {
+      const a = i * 4 + k, b = a + 4;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+    const g = new T.BufferGeometry();
+    g.setAttribute("position", new T.Float32BufferAttribute(pos, 3));
+    g.setIndex(idx);
+    g.computeVertexNormals();
+    let m;
+    if (this._orthoUV) {
+      const uv = [];
+      for (let i = 0; i < pos.length; i += 3) uv.push(...this._orthoUV([pos[i], pos[i + 2]]));
+      g.setAttribute("uv", new T.Float32BufferAttribute(uv, 2));
+      m = new T.MeshStandardMaterial({ color: 0xe2e2e2, roughness: 1, side: T.DoubleSide,
+        transparent: true, alphaTest: 0.02, alphaMap: this._orthoMats[0].alphaMap });
+      this._orthoMats.push(m);
+    } else {
+      worldUV(g);
+      m = new T.MeshStandardMaterial({ color: 0x5f7a45, roughness: 1, side: T.DoubleSide });
+    }
+    this._add(g, m).userData.room = z.id;
+  }
+
+  // ground height under a plan point: berms lift it
+  _groundY(pt) {
+    let y = 0;
+    this._zones().forEach((z) => {
+      if (z.kind !== "berm" || !z.line) return;
+      const d = lineDist(pt, z.line), h = z.height || 2, top = (z.width ?? 2) / 2, base = (z.base || 8) / 2;
+      if (d < base) y = Math.max(y, d <= top ? h : h * (base - d) / (base - top));
+    });
+    return y;
   }
 
   _buildOutdoor() {
@@ -1165,7 +1264,9 @@ class HouseReal extends HouseBase {
         mesh.userData.room = z.id;
         return mesh;
       };
-      if (kind === "water") {
+      if (kind === "berm") {
+        if (z.line?.length > 1) this._buildBerm(z);
+      } else if (kind === "water") {
         extrude(0.02, 0.03, mat.water).castShadow = false;
       } else if (kind === "hedge") {
         extrude(z.height || 1.6, 0, mat.hedge);

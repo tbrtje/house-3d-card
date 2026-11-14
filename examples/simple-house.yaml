@@ -58,3 +58,4 @@ outdoor:
     - { id: teich, name: Teich, kind: water, ellipse: [16, -6, 3, 2] }
     - { id: schuppen, name: Schuppen, kind: building, height: 2.2, rect: [16, 2, 19, 5] }
     - { id: hecke, kind: hedge, height: 1.6, rect: [-8, -14, -7.4, 14], label: false }
+    - { id: wall, kind: berm, line: [[-4, -13], [20, -13]], height: 1.8, width: 2, base: 7, label: false }
