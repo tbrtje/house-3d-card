@@ -5,7 +5,7 @@
  * The house geometry lives in the card config, never in this file.
  * SPDX-License-Identifier: MIT
  */
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 const THREE_URL = new URL("./three.module.min.js", import.meta.url).href;
 const WARM = [255, 183, 92];
 
@@ -60,8 +60,21 @@ const strip = (line, w) => {
   return [...line.map((c, i) => [c[0] + n[i][0] * w, c[1] + n[i][1] * w]),
     ...line.map((c, i) => [c[0] - n[i][0] * w, c[1] - n[i][1] * w]).reverse()];
 };
+// footprint of a w × d box at c, its front turned to heading (degrees, 0 = up on the plan, clockwise)
+const box = ([cx, cy], w, d, heading = 0) => {
+  const a = heading * Math.PI / 180, f = [Math.sin(a), -Math.cos(a)], s = [-f[1], f[0]];
+  return [[1, 1], [-1, 1], [-1, -1], [1, -1]].map(([i, j]) =>
+    [cx + s[0] * i * w / 2 + f[0] * j * d / 2, cy + s[1] * i * w / 2 + f[1] * j * d / 2]);
+};
+// stairs run from z.from up to z.to, the landing continues beyond z.to
+const stairEnd = (z) => {
+  const dx = z.to[0] - z.from[0], dy = z.to[1] - z.from[1], l = Math.hypot(dx, dy) || 1, k = (z.landing || 0) / l;
+  return [z.to[0] + dx * k, z.to[1] + dy * k];
+};
+const HEATPUMP = [1.17, 0.727, 0.96];     // SolvisLea Pro 7: width, depth, height in metres
 const outline = (z) => z.poly || (z.line ? strip(z.line, (z.base || 8) / 2) :
-  z.ellipse ? ellipse(z.ellipse) : rect(z.rect));
+  z.ellipse ? ellipse(z.ellipse) : z.from ? strip([z.from, stairEnd(z)], (z.width || 0.8) / 2) :
+  z.at ? (z.kind === "heatpump" ? box(z.at, HEATPUMP[0], HEATPUMP[1], z.heading) : box(z.at, 1, 1, z.heading)) : rect(z.rect));
 // distance from a point to a polyline
 const lineDist = ([x, y], line) => {
   let d = Infinity;
@@ -154,7 +167,7 @@ class HouseBase extends HTMLElement {
     const ids = ["sun.sun"];
     [...Object.values(this._config.rooms), ...this._zones()].forEach((r) => {
       ids.push(...(r.lights || []), ...(r.info || []).map((i) => i.entity || i));
-      ["temperature", "motion", "window"].forEach((k) => r[k] && ids.push(r[k]));
+      ["temperature", "motion", "window", "entity"].forEach((k) => r[k] && ids.push(r[k]));
     });
     return ids;
   }
@@ -184,8 +197,8 @@ class HouseBase extends HTMLElement {
   _hold(id) {
     const cfg = this._room(id);
     this._fire("haptic", "medium");
-    if (cfg.more_info) {
-      this._fire("hass-more-info", { entityId: cfg.more_info });
+    if (cfg.more_info || cfg.entity) {
+      this._fire("hass-more-info", { entityId: cfg.more_info || cfg.entity });
     } else if (cfg.path) {
       history.pushState(null, "", cfg.path);
       this._fire("location-changed", { replace: false });
@@ -259,7 +272,8 @@ class HouseBase extends HTMLElement {
 // =====================================================================
 const S_WALL = 1.0;                 // cut-away wall height
 const S_STACK = 4.6;                // gap between storeys in the stacked view
-const S_Z = { lawn: -0.1, road: -0.08, paved: -0.06, water: -0.05, deck: -0.02, slab: -0.03 };
+const S_Z = { lawn: -0.1, road: -0.08, paved: -0.06, water: -0.05, deck: -0.02, slab: -0.03, mower: -0.01, stairs: -0.02 };
+const S_FLAT = ["lawn", "paved", "road", "bed"];  // stacked in list order, like the realistic ground
 
 class HouseSchematic extends HouseBase {
   constructor() {
@@ -387,14 +401,17 @@ class HouseSchematic extends HouseBase {
     this._els = {};
     // outdoor zones: flat ground (lawn, road, paved, water, deck) or solid
     // objects with walls and a top (building, hedge); roof adds a canopy
+    const flat = this._zones().filter((z) => S_FLAT.includes(z.kind || "paved"));
     this._zones().forEach((z) => {
       const kind = z.kind === "berm" ? "lawn" : z.kind || "paved";
       const p = outline(z);
-      const solidObj = kind === "building" || kind === "hedge";
-      const fl = this._plane(outside, p, solidObj ? 0 : S_Z[kind] ?? S_Z.paved, z.id);
-      const walls = solidObj ? this._walls(outside, p, z.height || 2, z.id) : [];
+      const solidObj = kind === "building" || kind === "hedge" || kind === "heatpump";
+      const tall = z.height || (kind === "heatpump" ? HEATPUMP[2] : 2);
+      const zf = flat.includes(z) ? S_Z.lawn + 0.04 * flat.indexOf(z) / Math.max(1, flat.length - 1) : S_Z[kind] ?? S_Z.paved;
+      const fl = this._plane(outside, p, solidObj ? 0 : zf, z.id);
+      const walls = solidObj ? this._walls(outside, p, tall, z.id) : [];
       const tops = [];
-      if (solidObj) tops.push(this._plane(outside, p, z.height || 2, z.id));
+      if (solidObj) tops.push(this._plane(outside, p, tall, z.id));
       if (z.roof) tops.push(this._plane(outside, p, z.roof, z.id));
       tops.forEach((t) => t.classList.add("top"));
       let lb = null;
@@ -503,25 +520,25 @@ class HouseSchematic extends HouseBase {
     // floors are opaque so the lawn does not shine through, except the
     // floating upper storeys in the stacked view
     const solid = dark
-      ? { on: "#3a3d44", off: "#2e3036", lawn: "#2c4a2f", paved: "#45464b", road: "#1f2024", water: "#24425c", deck: "#5a4632",
+      ? { on: "#3a3d44", off: "#2e3036", lawn: "#2c4a2f", paved: "#45464b", bed: "#3b3026", mower: "#b5561c", heatpump: "#4a4d52", stairs: "#6b6f74", road: "#1f2024", water: "#24425c", deck: "#5a4632",
         building: "#4a4740", hedge: "#24401f", slab: "#1e1f23" }
-      : { on: "#e4e7ec", off: "#eef0f3", lawn: "#b9d7a8", paved: "#d3d3d6", road: "#8e9197", water: "#8fbfe0", deck: "#c8a77e",
+      : { on: "#e4e7ec", off: "#eef0f3", lawn: "#b9d7a8", paved: "#d3d3d6", bed: "#b7a184", mower: "#e8641b", heatpump: "#7d8187", stairs: "#b4b8bd", road: "#8e9197", water: "#8fbfe0", deck: "#c8a77e",
         building: "#c9c2b6", hedge: "#6f9a5f", slab: "#9a9ca3" };
     this._stage.style.setProperty("--slab", solid.slab);
     const seeThrough = this._floor === "all";
     let litRooms = 0;
     Object.values(this._els).forEach(({ g, cfg, fl, walls, tops, lb }) => {
       const linked = !!(this._config.rooms[g.id] ||
-        (g.out && ["lights", "temperature", "motion", "info", "more_info", "path"].some((k) => cfg[k])));
+        (g.out && ["lights", "temperature", "motion", "info", "more_info", "path", "entity"].some((k) => cfg[k])));
       const light = lightState(this._hass, cfg.lights);
       const tState = cfg.temperature && st[cfg.temperature];
       const temp = tState ? parseFloat(tState.state) : NaN;
       let under = g.out ? solid[g.kind] || solid.paved : linked ? solid.on : solid.off;
       if (seeThrough && g.floor > 0) under = `${base}${linked ? 0.13 : 0.06})`;
       let floor = under;
-      let wall = g.kind === "hedge" ? solid.hedge : g.kind === "building" ? solid.building
+      let wall = g.kind === "hedge" ? solid.hedge : g.kind === "building" ? solid.building : g.kind === "heatpump" ? solid.heatpump
         : `${base}${linked ? 0.16 : 0.08})`;
-      (tops || []).forEach((t, i) => (t.style.background = g.kind === "hedge" ? solid.hedge
+      (tops || []).forEach((t, i) => (t.style.background = g.kind === "hedge" || g.kind === "heatpump" ? solid[g.kind]
         : cfg.roof && i === tops.length - 1 ? `${base}0.14)` : solid.road));
       if (this._mode === "light" && light) {
         const a = 0.35 + 0.55 * light.bri;
@@ -542,6 +559,9 @@ class HouseSchematic extends HouseBase {
       if (light) bits.push(`<ha-icon class="lit" icon="mdi:lightbulb-on"></ha-icon>${light.count > 1 ? light.count : ""}`);
       if (cfg.motion && st[cfg.motion]?.state === "on") bits.push(`<ha-icon class="mot" icon="mdi:motion-sensor"></ha-icon>`);
       if (cfg.window && st[cfg.window]?.state === "on") bits.push(`<ha-icon class="win" icon="mdi:window-open-variant"></ha-icon>`);
+      if (g.kind === "mower" && st[cfg.entity]) {
+        bits.push(`<ha-icon class="inf" icon="mdi:robot-mower"></ha-icon><span class="inf">${this._hass.formatEntityState(st[cfg.entity])}</span>`);
+      }
       (cfg.info || []).forEach((i) => {
         const s = st[i.entity || i];
         if (!s) return;
@@ -646,6 +666,19 @@ const PAINT = {
       g.fill();
     }
   },
+};
+
+// flat outdoor zones on the ground texture; lawn matches the lawn plane around it
+const GROUND = {
+  lawn: { fill: "#55703f" },
+  paved: { fill: "#a39f97", joints: "rgba(60,55,50,.16)", edge: "rgba(70,66,60,.55)" },
+  // surfaces of paved zones (z.surface, default house.materials.paving); slabs is the plain one above
+  clinker: { fill: "#4e3129", bricks: ["#7d4434", "#6f3b2f", "#87503e", "#663529", "#7a4636", "#8c5744"], soldier: "#5f3328",
+    edge: "rgba(50,28,22,.7)" },
+  concrete: { fill: "#7f7d79", bricks: ["#a19e99", "#97948f", "#aaa7a2", "#9c9893"], edge: "rgba(70,66,60,.55)" },
+  gravel: { fill: "#b3aea5", speckle: ["#8f8a82", "#cfcac1", "#a29d94", "#7d786f", "#c2bdb4"], dense: 400 },
+  road: { fill: "#6c6e73", edge: "rgba(200,200,200,.35)" },
+  bed: { fill: "#5e4a36", speckle: ["#4c3b2a", "#6f5a43", "#556b3a"], edge: "rgba(40,32,24,.5)" },
 };
 
 // small deterministic random generator, so plants look the same on every load
@@ -908,6 +941,8 @@ class HouseReal extends HouseBase {
       m.renderOrder = -1;
       m.receiveShadow = true;
       scene.add(m);
+    } else {
+      this._buildGround();
     }
 
     if (house.shell) this._buildShell();
@@ -1159,8 +1194,29 @@ class HouseReal extends HouseBase {
       const off = (p) => Math.abs((p[0] - a[0]) * nx + (p[1] - a[1]) * nz);
       const here = doors.filter((d) => off(d.at) < 0.3 && along(d.at) > -0.1 && along(d.at) < len + 0.1);
       here.forEach((d) => {
-        face(this._add(new T.PlaneGeometry(d.width || 1.1, d.height || 2.15), mat.door, { cast: false }),
-          d.at[0], (d.sill || 0) + (d.height || 2.15) / 2, d.at[1], nx, nz, 0.02);
+        const dw = d.width || 1.1, dh = d.height || 2.15, base = d.sill || 0;
+        face(this._add(new T.PlaneGeometry(dw, dh), mat.door, { cast: false }), d.at[0], base + dh / 2, d.at[1], nx, nz, 0.02);
+        if (!d.arch) return;
+        // round arch: glazed fanlight with radial bars over the door, glass panes in the leaves,
+        // and a ring of bricks set on edge around it
+        const r = dw / 2, room = this._roomAt([d.at[0] - nx * 0.7, d.at[1] - nz * 0.7], 0);
+        const glass = new T.MeshStandardMaterial({ color: 0x1c2733, roughness: 0.15, metalness: 0.4, clippingPlanes: [this._clip] });
+        this._rooms[room?.id]?.windows.push(glass);
+        const half = (r0, r1, m, off) => face(this._add(new T.RingGeometry(r0, r1, 28, 1, 0, Math.PI), m, { cast: false }),
+          d.at[0], base + dh, d.at[1], nx, nz, off);
+        half(0, r, mat.door, 0.02);
+        half(0, r - 0.07, glass, 0.025).userData.room = room?.id;
+        half(r + 0.01, r + 0.13, mat.brick, 0.04);
+        [0.25, 0.5, 0.75].forEach((t) => {
+          const bar = face(this._add(new T.PlaneGeometry(0.035, r - 0.07), mat.door, { cast: false }), d.at[0], base + dh, d.at[1], nx, nz, 0.03);
+          bar.geometry.translate(0, (r - 0.07) / 2, 0);
+          bar.rotateZ((0.5 - t) * Math.PI);
+        });
+        [-1, 1].forEach((s) => {
+          const p = face(this._add(new T.PlaneGeometry(dw * 0.26, dh * 0.72), glass, { cast: false }), d.at[0], base + dh * 0.55, d.at[1], nx, nz, 0.025);
+          p.translateX(s * dw * 0.22);
+          p.userData.room = room?.id;
+        });
       });
       // windows given in house.windows replace the automatic ones of their floor on this wall
       const mine = fixed.filter((w) => off(w.at) < 0.3 && along(w.at) > -0.1 && along(w.at) < len + 0.1);
@@ -1298,6 +1354,296 @@ class HouseReal extends HouseBase {
     });
   }
 
+  // robot mower on its charging station at z.at, nose towards z.heading
+  // (degrees, 0 = up on the plan, clockwise)
+  _buildMower(z) {
+    const T = this._T;
+    const M = (color, o = {}) => new T.MeshStandardMaterial({ color, roughness: 0.5, ...o });
+    const cover = M(0x2f3237, { roughness: 0.35, metalness: 0.1 }), black = M(0x141517, { roughness: 0.8 });
+    const silver = M(0xb9bdc2, { roughness: 0.4, metalness: 0.3 }), orange = M(0xe0581c, { roughness: 0.4 });
+    const part = (parent, geo, m, x, y, zz) => {
+      const p = new T.Mesh(geo, m);
+      p.position.set(x, y, zz);
+      p.castShadow = p.receiveShadow = true;
+      p.userData.room = z.id;
+      parent.add(p);
+      return p;
+    };
+    // the group's -z axis is the nose direction
+    const g = new T.Group();
+    g.position.set(z.at[0], this._groundY(z.at), z.at[1]);
+    g.rotation.y = -(z.heading || 0) * Math.PI / 180;
+    // station: base plate the mower drives onto, housing with a green charge light in front
+    part(g, new T.BoxGeometry(0.56, 0.03, 0.62), M(0x2b2d30, { roughness: 0.8 }), 0, 0.015, -0.12);
+    part(g, new T.BoxGeometry(0.34, 0.2, 0.14), M(0x2b2d30), 0, 0.1, -0.5);
+    const led = part(g, new T.SphereGeometry(0.018, 8, 6), M(0x22aa66, { emissive: 0x33ff66, emissiveIntensity: 0 }), 0, 0.17, -0.43);
+    // mower, shaped after the Automower 450X: anthracite cover with two shoulders over the
+    // big rear wheels, low nose with badge, headlights and a black bumper, small front casters
+    const bot = new T.Group();
+    const body = new T.Shape();
+    const w = 0.25, l = 0.34, r = 0.12;
+    body.moveTo(-w + r, -l);
+    body.lineTo(w - r, -l); body.quadraticCurveTo(w, -l, w, -l + r);
+    body.lineTo(w, l - r); body.quadraticCurveTo(w, l, w - r, l);
+    body.lineTo(-w + r, l); body.quadraticCurveTo(-w, l, -w, l - r);
+    body.lineTo(-w, -l + r); body.quadraticCurveTo(-w, -l, -w + r, -l);
+    const chassis = new T.ExtrudeGeometry(body, { depth: 0.05, bevelEnabled: true, bevelSize: 0.02, bevelThickness: 0.02, bevelSegments: 2 });
+    chassis.rotateX(-Math.PI / 2);
+    part(bot, chassis, black, 0, 0.03, 0);
+    const dome = (sx, sy, sz) => {
+      const d = new T.SphereGeometry(1, 20, 10, 0, Math.PI * 2, 0, Math.PI / 2);
+      d.scale(sx, sy, sz);
+      return d;
+    };
+    part(bot, dome(0.23, 0.16, 0.35), cover, 0, 0.09, 0);
+    [-1, 1].forEach((s) => part(bot, dome(0.1, 0.21, 0.25), cover, s * 0.2, 0.09, 0.12));
+    part(bot, new T.BoxGeometry(0.08, 0.012, 0.03), orange, 0, 0.24, 0.13);
+    const badge = part(bot, new T.BoxGeometry(0.07, 0.08, 0.012), M(0xd5d7da), 0, 0.16, -0.31);
+    badge.rotation.x = -0.9;
+    const lamp = M(0xffffff, { emissive: 0xffffff, emissiveIntensity: 0.6 });
+    [-1, 1].forEach((s) => part(bot, new T.BoxGeometry(0.08, 0.012, 0.01), lamp, s * 0.12, 0.125, -0.29));
+    const wheel = new T.CylinderGeometry(0.13, 0.13, 0.06, 20);
+    wheel.rotateZ(Math.PI / 2);
+    const rim = new T.CylinderGeometry(0.09, 0.09, 0.006, 20);
+    rim.rotateZ(Math.PI / 2);
+    const hub = new T.CylinderGeometry(0.035, 0.035, 0.006, 12);
+    hub.rotateZ(Math.PI / 2);
+    [-1, 1].forEach((s) => {
+      part(bot, wheel, black, s * 0.26, 0.13, 0.17);
+      part(bot, rim, silver, s * 0.292, 0.13, 0.17);
+      part(bot, hub, orange, s * 0.296, 0.13, 0.17);
+    });
+    const caster = new T.CylinderGeometry(0.04, 0.04, 0.03, 10);
+    caster.rotateZ(Math.PI / 2);
+    [-1, 1].forEach((s) => part(bot, caster, black, s * 0.13, 0.04, -0.24));
+    g.add(bot);
+    this._scene.add(g);
+    this._mowers.push({ z, bot, led });
+  }
+
+  // air-to-water heat pump shaped after the SolvisLea Pro: anthracite cabinet on a
+  // base frame, logo panel on the left and the fan grille on the right of its front
+  _buildHeatPump(z) {
+    const T = this._T, [w, d, h] = HEATPUMP;
+    const M = (color, o = {}) => new T.MeshStandardMaterial({ color, roughness: 0.6, ...o });
+    const dark = M(0x2b2e33), body = M(0x3b3f45), lid = M(0x464a50, { roughness: 0.5 });
+    const g = new T.Group();
+    g.position.set(z.at[0], this._groundY(z.at), z.at[1]);
+    g.rotation.y = -(z.heading || 0) * Math.PI / 180;      // front faces local -z
+    const part = (geo, m, x, y, zz) => {
+      const p = new T.Mesh(geo, m);
+      p.position.set(x, y, zz);
+      p.castShadow = p.receiveShadow = true;
+      p.userData.room = z.id;
+      g.add(p);
+      return p;
+    };
+    [-1, 1].forEach((i) => [-1, 1].forEach((j) => part(new T.BoxGeometry(0.08, 0.06, 0.08), dark, i * (w / 2 - 0.08), 0.03, j * (d / 2 - 0.08))));
+    part(new T.BoxGeometry(w - 0.04, 0.08, d - 0.04), dark, 0, 0.1, 0);
+    const top = h - 0.035;
+    part(new T.BoxGeometry(w, top - 0.14, d), body, 0, (top + 0.14) / 2, 0);
+    part(new T.BoxGeometry(w + 0.03, 0.035, d + 0.03), lid, 0, h - 0.0175, 0);
+    // front: logo panel and grille painted on one face
+    const fh = top - 0.14, c = document.createElement("canvas");
+    c.width = 512;
+    c.height = Math.round(512 * fh / w);
+    const x = c.getContext("2d"), split = Math.round(c.width * 0.4);
+    x.fillStyle = "#3b3f45";
+    x.fillRect(0, 0, c.width, c.height);
+    x.fillStyle = "#16181b";
+    x.fillRect(split, 0, c.width - split, c.height);
+    x.strokeStyle = "#34373c";
+    x.lineWidth = 2;
+    for (let i = split + 6; i < c.width; i += 11) x.beginPath(), x.moveTo(i, 0), x.lineTo(i, c.height), x.stroke();
+    for (let j = 6; j < c.height; j += 9) x.beginPath(), x.moveTo(split, j), x.lineTo(c.width, j), x.stroke();
+    x.strokeStyle = x.fillStyle = "#8d9196";
+    x.lineWidth = 3;
+    x.beginPath();
+    x.arc(48, 62, 22, 0.6 * Math.PI, 1.9 * Math.PI);
+    x.stroke();
+    x.font = "bold 22px sans-serif";
+    x.fillText("SOLVIS", 46, 74);
+    const t = new T.CanvasTexture(c);
+    t.colorSpace = T.SRGBColorSpace;
+    const face = new T.Mesh(new T.PlaneGeometry(w, fh), new T.MeshStandardMaterial({ map: t, roughness: 0.6 }));
+    face.rotation.y = Math.PI;
+    face.position.set(0, (top + 0.14) / 2, -d / 2 - 0.002);
+    face.receiveShadow = true;
+    face.userData.room = z.id;
+    g.add(face);
+    this._scene.add(g);
+  }
+
+  // steel stairs with grating treads from z.from up to z.height at z.to, a landing
+  // beyond, and a handrail on the side that does not run along the house wall
+  _buildStairs(z) {
+    const T = this._T, w = z.width || 0.8, h = z.height || 2.4, land = z.landing || 0;
+    const dx = z.to[0] - z.from[0], dy = z.to[1] - z.from[1], L = Math.hypot(dx, dy) || 1;
+    const steel = new T.MeshStandardMaterial({ color: 0xa3a8ad, metalness: 0.5, roughness: 0.45, side: T.DoubleSide });
+    const grid = canvasTex(T, 64, (c, n) => {
+      c.fillStyle = "#000"; c.fillRect(0, 0, n, n);
+      c.fillStyle = "#fff";
+      for (let i = 0; i < 4; i++) c.fillRect(i * n / 4, 0, 7, n), c.fillRect(0, i * n / 4, n, 4);
+    }, 0.1);
+    const grating = new T.MeshStandardMaterial({ color: 0xa3a8ad, metalness: 0.5, roughness: 0.5, alphaMap: grid, alphaTest: 0.5, side: T.DoubleSide });
+    // local frame: +x up the run, +z across, y up
+    const g = new T.Group();
+    g.position.set(z.from[0], this._groundY(z.from), z.from[1]);
+    g.rotation.y = -Math.atan2(dy, dx);
+    const add = (geo, m, x, y, zz) => {
+      const p = new T.Mesh(geo, m);
+      p.position.set(x, y, zz);
+      p.castShadow = p.receiveShadow = true;
+      p.userData.room = z.id;
+      g.add(p);
+      return p;
+    };
+    // a square bar between two local points
+    const bar = (a, b, t = 0.04, m = steel) => {
+      const v = new T.Vector3(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+      const p = add(new T.BoxGeometry(v.length(), t, t), m, (a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2);
+      p.quaternion.setFromUnitVectors(new T.Vector3(1, 0, 0), v.normalize());
+      return p;
+    };
+    const n = Math.max(2, Math.round(h / 0.19)), go = L / n;
+    for (let i = 1; i < n; i++) add(worldUV(new T.BoxGeometry(go + 0.03, 0.03, w - 0.02)), grating, i * go, i * h / n - 0.015, 0);
+    if (land) {
+      add(worldUV(new T.BoxGeometry(land, 0.04, w)), grating, L + land / 2, h - 0.02, 0);
+      [L + 0.04, L + land - 0.04].forEach((x) => [-1, 1].forEach((s) => bar([x, 0, s * (w / 2 - 0.03)], [x, h - 0.04, s * (w / 2 - 0.03)], 0.06)));
+    }
+    [-1, 1].forEach((s) => add(new T.BoxGeometry(Math.hypot(L, h) + 0.1, 0.2, 0.012), steel, L / 2, h / 2 - 0.06, s * w / 2)
+      .rotation.z = Math.atan2(h, L));
+    // the wall is on the side where a point just beyond the stairs lies inside the house
+    const shell = this._house.shell || [];
+    const side = (s) => [z.from[0] + dx / 2 - s * dy / L * (w / 2 + 0.4), z.from[1] + dy / 2 + s * dx / L * (w / 2 + 0.4)];
+    const open = shell.length && inside(side(1), shell) ? -1 : 1;
+    const rz = open * (w / 2 + 0.02), rh = 0.95, end = L + land;
+    const posts = [0.15, L / 2, L, end];
+    posts.forEach((x) => {
+      const y = Math.min(h, x / L * h);
+      bar([x, y, rz], [x, y + rh, rz]);
+    });
+    [rh, rh / 2].forEach((k) => {
+      bar([0.15, 0.15 / L * h + k, rz], [L, h + k, rz], k === rh ? 0.045 : 0.025);
+      if (land) bar([L, h + k, rz], [end, h + k, rz], k === rh ? 0.045 : 0.025);
+    });
+    if (land) {
+      // rail across the far end of the landing, back to the wall
+      bar([end, h, -rz], [end, h + rh, -rz]);
+      bar([end, h + rh, rz], [end, h + rh, -rz], 0.045);
+      bar([end, h + rh / 2, rz], [end, h + rh / 2, -rz], 0.025);
+    }
+    this._scene.add(g);
+  }
+
+  // flat zones (lawn, paved, road, bed) painted in list order onto one ground
+  // texture: a lawn island listed after the paving lies on top, edges stay crisp
+  _buildGround() {
+    const T = this._T;
+    const flat = this._zones().filter((z) => ["lawn", "paved", "road", "bed"].includes(z.kind || "paved"));
+    const paving = this._house.materials?.paving;
+    const lookOf = (z) => (z.kind || "paved") === "paved" ? GROUND[z.surface || paving] || GROUND.paved : GROUND[z.kind];
+    if (!flat.length) return;
+    const pts = flat.flatMap(outline);
+    const x0 = Math.min(...pts.map((p) => p[0])) - 0.5, x1 = Math.max(...pts.map((p) => p[0])) + 0.5;
+    const z0 = Math.min(...pts.map((p) => p[1])) - 0.5, z1 = Math.max(...pts.map((p) => p[1])) + 0.5;
+    const ppm = Math.min(48, 4096 / Math.max(x1 - x0, z1 - z0));
+    const c = document.createElement("canvas");
+    c.width = Math.ceil((x1 - x0) * ppm);
+    c.height = Math.ceil((z1 - z0) * ppm);
+    const g = c.getContext("2d");
+    // opaque lawn around the zones: a transparent edge would filter into a dark seam
+    g.fillStyle = GROUND.lawn.fill;
+    g.fillRect(0, 0, c.width, c.height);
+    g.setTransform(ppm, 0, 0, ppm, -x0 * ppm, -z0 * ppm);
+    const rnd = seeded(11);
+    flat.forEach((z) => {
+      const look = lookOf(z), p = outline(z);
+      const path = new Path2D();
+      p.forEach(([x, y], i) => (i ? path.lineTo(x, y) : path.moveTo(x, y)));
+      path.closePath();
+      g.fillStyle = look.fill;
+      g.fill(path);
+      g.save();
+      g.clip(path);
+      const [bx0, bz0, bx1, bz1] = bounds([{ p }]);
+      if (look.joints) {
+        // paving joints on a 40 cm grid
+        g.strokeStyle = look.joints;
+        g.lineWidth = 0.03;
+        g.beginPath();
+        for (let x = Math.floor(bx0 / 0.4) * 0.4; x < bx1; x += 0.4) g.moveTo(x, bz0), g.lineTo(x, bz1);
+        for (let y = Math.floor(bz0 / 0.4) * 0.4; y < bz1; y += 0.4) g.moveTo(bx0, y), g.lineTo(bx1, y);
+        g.stroke();
+      }
+      if (look.bricks) {
+        // 20 × 10 cm pavers in stretcher bond, a little apart so the joints show
+        for (let y = Math.floor(bz0 / 0.1) * 0.1, r = 0; y < bz1; y += 0.1, r++) {
+          for (let x = Math.floor(bx0 / 0.2) * 0.2 - (r % 2) * 0.1; x < bx1; x += 0.2) {
+            g.fillStyle = look.bricks[Math.floor(rnd() * look.bricks.length)];
+            g.fillRect(x + 0.006, y + 0.006, 0.188, 0.088);
+          }
+        }
+      }
+      if (look.speckle) {
+        // mulch and soil crumbs, or gravel
+        const n = (bx1 - bx0) * (bz1 - bz0) * (look.dense || 40), sz = look.dense ? 0.035 : 0.05;
+        for (let i = 0; i < n; i++) {
+          g.fillStyle = look.speckle[i % look.speckle.length];
+          g.fillRect(bx0 + rnd() * (bx1 - bx0), bz0 + rnd() * (bz1 - bz0), sz, sz);
+        }
+      }
+      g.restore();
+      if (look.edge) {
+        // no kerb where the zone runs on into another zone of the same surface
+        const same = flat.filter((o) => o !== z && lookOf(o) === look).map(outline);
+        const kerb = new Path2D();
+        p.forEach((a, i) => {
+          const b = p[(i + 1) % p.length], l = Math.hypot(b[0] - a[0], b[1] - a[1]), n = Math.ceil(l / 0.25);
+          for (let k = 0; k < n; k++) {
+            const t0 = k / n, t1 = (k + 1) / n, tm = (t0 + t1) / 2;
+            const m = [a[0] + (b[0] - a[0]) * tm, a[1] + (b[1] - a[1]) * tm];
+            const o = [(b[1] - a[1]) / l * 0.1, -(b[0] - a[0]) / l * 0.1];
+            const out = inside([m[0] + o[0], m[1] + o[1]], p) ? [m[0] - o[0], m[1] - o[1]] : [m[0] + o[0], m[1] + o[1]];
+            if (same.some((q) => inside(out, q))) continue;
+            kerb.moveTo(a[0] + (b[0] - a[0]) * t0, a[1] + (b[1] - a[1]) * t0);
+            kerb.lineTo(a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1);
+          }
+        });
+        g.lineCap = "butt";
+        if (look.soldier) {
+          // soldier course: a row of pavers set crosswise along the edge, inside the zone
+          g.save();
+          g.clip(path);
+          g.strokeStyle = look.edge;
+          g.lineWidth = 0.42;
+          g.stroke(kerb);
+          g.strokeStyle = look.soldier;
+          g.lineWidth = 0.38;
+          g.setLineDash([0.09, 0.012]);
+          g.stroke(kerb);
+          g.restore();
+        } else {
+          g.strokeStyle = look.edge;
+          g.lineWidth = 0.08;
+          g.lineCap = "round";
+          g.stroke(kerb);
+        }
+      }
+    });
+    const t = new T.CanvasTexture(c);
+    t.colorSpace = T.SRGBColorSpace;
+    t.anisotropy = this._renderer.capabilities.getMaxAnisotropy();
+    const geo = new T.PlaneGeometry(x1 - x0, z1 - z0);
+    geo.rotateX(-Math.PI / 2);
+    const m = new T.Mesh(geo, new T.MeshStandardMaterial({ map: t, roughness: 1 }));
+    m.position.set((x0 + x1) / 2, 0.005, (z0 + z1) / 2);
+    m.receiveShadow = true;
+    // a tap on the ground finds the topmost zone under it
+    m.userData.zoneAt = ([x, y]) => flat.findLast((z) => inside([x, y], outline(z)))?.id;
+    this._scene.add(m);
+  }
+
   // earth wall along z.line with a trapezoid cross-section, draped with the aerial photo
   _buildBerm(z) {
     const T = this._T, h = z.height || 2, top = (z.width ?? 2) / 2, base = (z.base || 8) / 2;
@@ -1354,6 +1700,7 @@ class HouseReal extends HouseBase {
   _buildOutdoor() {
     const T = this._T, mat = this._mat;
     this._zoneLights = [];
+    this._mowers = [];
     this._zones().forEach((z) => {
       const kind = z.kind || "paved";
       const p = outline(z);
@@ -1371,6 +1718,12 @@ class HouseReal extends HouseBase {
         if (z.line?.length > 1) this._buildBerm(z);
       } else if (kind === "water") {
         extrude(0.02, 0.03, mat.water).castShadow = false;
+      } else if (kind === "mower") {
+        this._buildMower(z);
+      } else if (kind === "heatpump") {
+        this._buildHeatPump(z);
+      } else if (kind === "stairs") {
+        this._buildStairs(z);
       } else if (kind === "hedge") {
         extrude(z.height || 1.6, 0, mat.hedge);
       } else if (kind === "deck") {
@@ -1496,6 +1849,13 @@ class HouseReal extends HouseBase {
       l.intensity = s ? (4 + 16 * night) * s.bri : 0;
       if (s) l.color.set(`rgb(${s.rgb})`);
     });
+    // robot mower: on its station when docked, otherwise out on the lawn in front of it
+    this._mowers.forEach(({ z, bot, led }) => {
+      const state = st[z.entity]?.state, home = !z.entity || !state || state === "docked";
+      bot.position.set(0, 0, home ? 0 : 2.2);
+      bot.rotation.y = home ? 0 : 2.5;
+      led.material.emissiveIntensity = home ? 1.5 : 0;
+    });
     this.shadowRoot.querySelector(".sum").textContent =
       lit ? `Licht in ${lit} ${lit === 1 ? "Raum" : "Räumen"}` : "Alle Lichter aus";
     this._renderLabels();
@@ -1540,7 +1900,7 @@ class HouseReal extends HouseBase {
       -((y - rect.top) / rect.height) * 2 + 1), this._camera);
     const cut = this._clip.constant;
     const hit = ray.intersectObjects(this._scene.children, true).find((h) => h.point.y < cut);
-    const id = hit?.object.userData.room;
+    const id = hit?.object.userData.room ?? hit?.object.userData.zoneAt?.([hit.point.x, hit.point.z]);
     if (!id) return null;
     return this._mode === "house" || !this._rooms[id] || this._rooms[id].f === +this._mode ? id : null;
   }
